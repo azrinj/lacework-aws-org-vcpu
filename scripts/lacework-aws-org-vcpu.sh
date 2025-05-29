@@ -36,9 +36,11 @@ echo "Using AWS Profile: $AWS_PROFILE"
 echo "Using AWS Region: $AWS_REGION (for AWS Organizations API calls)"
 echo
 
-# Get all accounts in the organization
-echo "Retrieving accounts from AWS Organization..."
-ACCOUNTS=$(aws organizations list-accounts --query "Accounts[?Status=='ACTIVE'].Id" --output text)
+# Get all accounts in the organization (use profile)
+ACCOUNTS=$(aws organizations list-accounts --query "Accounts[?Status=='ACTIVE'].Id" --output text --profile "$AWS_PROFILE")
+
+# Unset AWS_PROFILE after org-level calls
+unset AWS_PROFILE
 
 if [ -z "$ACCOUNTS" ]; then
     echo "Error: No active accounts found in the organization."
@@ -55,32 +57,43 @@ ORG_TOTAL_ECS_VCPU=0
 
 # Process each account
 for ACCOUNT_ID in $ACCOUNTS; do
+    echo "============================================="
     echo "Processing account: $ACCOUNT_ID"
-    
-    # Assume role in the account
-    ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole"
-    
-    # Try to assume role in the account
-    aws sts assume-role \
+    echo "============================================="
+
+    # Clear any existing temporary credentials
+    unset AWS_ACCESS_KEY_ID
+    unset AWS_SECRET_ACCESS_KEY
+    unset AWS_SESSION_TOKEN
+
+    # Set the role ARN
+    ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/<edityourRoleHere>"
+    echo "Attempting to assume role: $ROLE_ARN"
+
+    # Use your SSO profile for assume-role
+    CREDENTIALS=$(aws sts assume-role \
         --role-arn "$ROLE_ARN" \
         --role-session-name "EC2ECSInventorySession" \
         --query "Credentials" \
-        --output json > /tmp/credentials.json 2>/tmp/error.txt
-    
+        --output json --profile masteradmin 2> >(tee /tmp/error.txt >&2))
+
     if [ $? -ne 0 ]; then
-        echo "  Warning: Could not assume role in $ACCOUNT_ID (permission denied or role doesn't exist), skipping..."
+        echo "Warning: Could not assume role in $ACCOUNT_ID (permission denied or role doesn't exist), skipping..."
+        echo
         continue
     fi
-    
-    # Read credentials from file
-    CREDENTIALS=$(cat /tmp/credentials.json)
-    rm -f /tmp/credentials.json /tmp/error.txt
-    
-    # Extract credentials
-    export AWS_ACCESS_KEY_ID=$(echo $CREDENTIALS | jq -r '.AccessKeyId')
-    export AWS_SECRET_ACCESS_KEY=$(echo $CREDENTIALS | jq -r '.SecretAccessKey')
-    export AWS_SESSION_TOKEN=$(echo $CREDENTIALS | jq -r '.SessionToken')
-    
+
+    # Save credentials to file for debugging
+    echo "$CREDENTIALS" > /tmp/credentials.json
+
+    # Read and export credentials
+    export AWS_ACCESS_KEY_ID=$(jq -r '.AccessKeyId' /tmp/credentials.json)
+    export AWS_SECRET_ACCESS_KEY=$(jq -r '.SecretAccessKey' /tmp/credentials.json)
+    export AWS_SESSION_TOKEN=$(jq -r '.SessionToken' /tmp/credentials.json)
+
+    # Unset AWS_PROFILE to ensure only env vars are used
+    unset AWS_PROFILE
+
     # Create temporary file for account-specific counters
     ACCOUNT_EC2_COUNTS_FILE=$(mktemp)
     
@@ -266,8 +279,11 @@ for ACCOUNT_ID in $ACCOUNTS; do
     
     # Clean up account counts file
     rm -f "$ACCOUNT_EC2_COUNTS_FILE"
-    
-    # Clear temporary credentials
+
+    # Clean up temporary files
+    rm -f /tmp/credentials.json /tmp/error.txt
+
+    # Clear credentials
     unset AWS_ACCESS_KEY_ID
     unset AWS_SECRET_ACCESS_KEY
     unset AWS_SESSION_TOKEN
